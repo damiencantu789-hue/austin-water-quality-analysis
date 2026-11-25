@@ -1,0 +1,457 @@
+---
+title: "Austin Water Quality: Exploratory Data Analysis"
+author: "Damien Cantu, dkc958"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, fig.align = "center")
+library(tidyverse)
+library(knitr)
+```
+
+# Introduction
+
+The data set used for this project is the **Water Quality Sampling Data** from the Austin Data Portal. Each row is one water quality sample, defined by date, location, and parameter. I downloaded the data as a CSV file and imported it into R. Because I am using a single data set, no joins are needed.
+
+I focus on three parameters, one for each type of measurement. Each is analyzed separately:
+
+* **Water temperature** (physical), in °C
+* **Dissolved oxygen** (chemical), in mg/L
+* **E. coli bacteria** (biological), in MPN/100 mL
+
+These are measurable indicators of the state of a body of water.
+
+**Research question:** How do E. coli (MPN/100 mL), water temperature (°C), and dissolved oxygen (mg/L) vary between streams, lakes, and springs and across Austin watersheds, and how do these levels change by month and year?
+
+**Why site type matters.** The three water body types differ physically and biologically, so I expect them to differ on these parameters:
+
+* Streams are flowing and well mixed, and they receive runoff, which can raise E. coli after rain.
+* Lakes are still and can stratify with depth. Warm, deep, or stagnant water tends to hold less dissolved oxygen.
+* Springs are fed by groundwater, so I expect their temperature to be steady across seasons.
+
+Comparing site types is therefore a core part of the question, not just a grouping variable. Watersheds add a geographic comparison, and month and year add the seasonal and long-term comparisons.
+
+**Relevance.** Dissolved oxygen supports aquatic life, E. coli indicates possible fecal contamination and affects swimming safety, and temperature influences both. Tracking how they vary by place and time shows where and when Austin's waterways are healthiest, and where they may be at risk.
+
+# Wrangling
+
+## Loading and cleaning
+
+```{r load}
+wq_raw <- read_csv("Water_Quality_Sampling_Data_20261009.csv",
+                   col_types = cols(RESULT = col_character(),
+                                    SAMPLE_DATE = col_character()))
+
+dim(wq_raw)
+```
+
+The raw data has `r format(nrow(wq_raw), big.mark = ",")` rows (samples) and `r ncol(wq_raw)` columns.
+
+I made two fixes to my earlier wrangling:
+
+1. **RESULT** was being read with `as.numeric()`, which turned every value over 1,000 (written with a comma) into `NA`. I now remove the commas first, then convert, which recovers those values.
+2. **SAMPLE_DATE** had been misread, with years falling between 1 and 12. I now use `mdy_hms()`, which converts the dates correctly.
+
+```{r convert}
+wq_raw <- wq_raw |>
+  mutate(RESULT = as.numeric(str_replace_all(RESULT, ",", "")),
+         SAMPLE_DATE = mdy_hms(SAMPLE_DATE),
+         year = year(SAMPLE_DATE),
+         month = month(SAMPLE_DATE),
+         month_label = month(SAMPLE_DATE, label = TRUE))
+
+range(wq_raw$SAMPLE_DATE, na.rm = TRUE)
+sum(is.na(wq_raw$SAMPLE_DATE))
+```
+
+## Filtering and selecting
+
+I kept only the most common kind of sample. Soil, wells, and sediment are not comparable to open water bodies, so I kept:
+
+* surface water
+* routine samples (no blanks or replicates)
+* the three most common water body types (stream, lake, spring)
+* only the variables needed for the research question
+
+```{r filter}
+wq <- wq_raw |>
+  filter(MEDIUM == "Surface Water",
+         is.na(QC_TYPE),
+         SITE_TYPE %in% c("Stream", "Lake", "Spring")) |>
+  select(SITE_TYPE, WATERSHED, PARAMETER, UNIT, DEPTH_IN_METERS,
+         RESULT, QUALIFIER, SAMPLE_DATE, year, month, month_label) |>
+  drop_na(RESULT)          # rows with a missing result cannot be analyzed
+```
+
+Next I split the data by parameter, keeping a single unit for each so values are comparable.
+
+```{r split}
+wq_temp  <- wq |> filter(PARAMETER == "WATER TEMPERATURE", UNIT == "Deg. Celsius")
+wq_do    <- wq |> filter(PARAMETER == "DISSOLVED OXYGEN",  UNIT == "MG/L")
+wq_ecoli <- wq |> filter(PARAMETER == "E COLI BACTERIA",   UNIT == "MPN/100ML")
+
+# Maximum of each parameter before removing impossible values
+c(temp = max(wq_temp$RESULT), do = max(wq_do$RESULT), ecoli = max(wq_ecoli$RESULT))
+```
+
+The maximum of 9999 for temperature and dissolved oxygen is a placeholder or error code, not a real measurement. Real surface-water temperatures and dissolved oxygen readings are far below 50. I therefore removed values of 50 or more for these two parameters. I did **not** cut E. coli, because real E. coli counts can be very high after storms.
+
+```{r remove-impossible}
+wq_temp <- wq_temp |> filter(RESULT < 50)
+wq_do   <- wq_do   |> filter(RESULT < 50)
+```
+
+## Final data set
+
+```{r final}
+tibble(Dataset = c("Water temperature", "Dissolved oxygen", "E. coli"),
+       Rows = c(nrow(wq_temp), nrow(wq_do), nrow(wq_ecoli)),
+       Columns = c(ncol(wq_temp), ncol(wq_do), ncol(wq_ecoli))) |>
+  add_row(Dataset = "Total", Rows = nrow(wq_temp) + nrow(wq_do) + nrow(wq_ecoli),
+          Columns = ncol(wq_temp)) |>
+  kable(caption = "Dimensions of the cleaned data sets")
+
+# One combined data set with readable labels, used for plotting
+wq_all <- bind_rows(wq_temp, wq_do, wq_ecoli) |>
+  mutate(parameter_label = factor(PARAMETER,
+           levels = c("WATER TEMPERATURE", "DISSOLVED OXYGEN", "E COLI BACTERIA"),
+           labels = c("Water Temperature (°C)", "Dissolved Oxygen (mg/L)",
+                      "E. coli (MPN/100 mL)")),
+         SITE_TYPE = factor(SITE_TYPE, levels = c("Stream", "Lake", "Spring")))
+```
+
+The final data set has **`r format(nrow(wq_all), big.mark = ",")` rows and `r ncol(wq_temp)` columns**. The variables are:
+
+| Variable | Description |
+|---|---|
+| SITE_TYPE | Type of water body (stream, lake, spring), categorical |
+| WATERSHED | Watershed the site belongs to, categorical |
+| PARAMETER, UNIT | What was measured and its unit |
+| DEPTH_IN_METERS | Depth of the sample below the surface, numeric |
+| RESULT | The measured value, numeric |
+| QUALIFIER | Flag for values below or above a detection limit |
+| SAMPLE_DATE, year, month, month_label | Sample date-time and the variables I derived from it |
+
+## Limitations
+
+```{r limitations}
+# Missing depth by parameter
+wq_all |>
+  group_by(Parameter = parameter_label) |>
+  summarize(Samples = n(),
+            `Missing depth` = sum(is.na(DEPTH_IN_METERS)),
+            `% missing` = round(100 * mean(is.na(DEPTH_IN_METERS)), 1)) |>
+  kable(caption = "Missing depth by parameter")
+
+# Where depth is recorded
+wq_all |>
+  filter(!is.na(DEPTH_IN_METERS)) |>
+  count(SITE_TYPE) |>
+  kable(caption = "Samples with a recorded depth, by site type")
+
+# E. coli values flagged as below or above a detection limit
+censored <- wq_ecoli |> filter(str_detect(QUALIFIER, "[<>]")) |> nrow()
+zeros    <- sum(wq_ecoli$RESULT == 0)
+
+# Share of lake samples from Lady Bird Lake
+lake_share <- wq_all |>
+  filter(SITE_TYPE == "Lake") |>
+  summarize(share = mean(WATERSHED == "Lady Bird Lake")) |>
+  pull(share)
+```
+
+* **Missing depth.** Depth is missing for about half of the temperature and dissolved oxygen samples and for most E. coli samples (see the table above). It is recorded mostly at lakes, so depth comparisons mainly describe lakes.
+* **Extreme and skewed values.** E. coli is heavily right skewed, so I use a log scale when plotting it. `r censored` E. coli results are flagged as below or above a detection limit, so their true value is unknown. `r zeros` E. coli results equal 0 and cannot be shown on a log scale, so they are left off the log plots.
+* **Remaining outliers.** Even after removing values of 50 or more, some dissolved oxygen readings (above about 20 mg/L) are physically unlikely. I kept them but treat them with caution.
+* **Uneven sampling.** Sampling effort differs a lot across years and watersheds, and `r round(100 * lake_share)`% of lake samples come from Lady Bird Lake. "Lake" results therefore mostly describe Lady Bird Lake rather than all Austin lakes.
+
+# Exploratory Data Analysis
+
+```{r helpers}
+# Summary statistics helper
+summ <- function(data, ...) {
+  data |>
+    group_by(...) |>
+    summarize(n = n(),
+              mean = round(mean(RESULT), 2),
+              median = round(median(RESULT), 2),
+              sd = round(sd(RESULT), 2),
+              IQR = round(IQR(RESULT), 2),
+              min = round(min(RESULT), 2),
+              max = round(max(RESULT), 2),
+              .groups = "drop")
+}
+
+# Plain E. coli data for log plots (zeros cannot be logged)
+ecoli_pos <- wq_ecoli |> filter(RESULT > 0)
+```
+
+## Distribution of each variable
+
+### Site type
+
+```{r site-type}
+wq_all |>
+  count(SITE_TYPE, parameter_label) |>
+  ggplot(aes(x = SITE_TYPE, y = n, fill = SITE_TYPE)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~parameter_label, scales = "free_y") +
+  labs(title = "Number of Samples by Site Type",
+       x = "Site Type", y = "Number of Samples")
+
+wq_all |> count(SITE_TYPE) |> mutate(percent = round(100 * n / sum(n), 1)) |> kable()
+```
+
+Streams contribute most of the samples, with fewer from lakes and fewer still from springs. Spring results therefore rest on the least data.
+
+### Watershed
+
+```{r watershed}
+top_ws <- wq_all |> count(WATERSHED, sort = TRUE) |> slice_head(n = 10)
+
+ggplot(top_ws, aes(x = reorder(WATERSHED, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Ten Most Sampled Watersheds (Final Data Set)",
+       x = "Watershed", y = "Number of Samples")
+
+kable(top_ws, col.names = c("Watershed", "Samples"))
+```
+
+I show only the ten most sampled watersheds to keep the graph readable. Later comparisons use the watersheds with the most data.
+
+### Depth
+
+```{r depth}
+wq_all |>
+  filter(!is.na(DEPTH_IN_METERS)) |>
+  ggplot(aes(x = DEPTH_IN_METERS)) +
+  geom_histogram(binwidth = 1, color = "black") +
+  labs(title = "Distribution of Sample Depth (samples with a recorded depth)",
+       x = "Depth (meters)", y = "Number of Samples")
+
+wq_all |>
+  summarize(n_with_depth = sum(!is.na(DEPTH_IN_METERS)),
+            mean = round(mean(DEPTH_IN_METERS, na.rm = TRUE), 2),
+            median = median(DEPTH_IN_METERS, na.rm = TRUE),
+            sd = round(sd(DEPTH_IN_METERS, na.rm = TRUE), 2),
+            max = max(DEPTH_IN_METERS, na.rm = TRUE)) |>
+  kable(caption = "Summary of DEPTH_IN_METERS")
+```
+
+### Sample date: month and year
+
+```{r month-year}
+wq_all |>
+  ggplot(aes(x = month_label)) +
+  geom_bar() +
+  labs(title = "Number of Samples by Month",
+       x = "Month", y = "Number of Samples")
+
+wq_all |>
+  filter(year >= 1990) |>
+  ggplot(aes(x = year)) +
+  geom_histogram(binwidth = 1, center = 0.5, color = "black") +
+  labs(title = "Number of Samples per Year, 1990 Onward",
+       x = "Year", y = "Number of Samples")
+```
+
+Sampling is not spread evenly over months or years. This matters for the seasonal and long-term comparisons below, so I report the sample size alongside every statistic.
+
+### RESULT: water temperature
+
+```{r temp-dist}
+ggplot(wq_temp, aes(x = RESULT)) +
+  geom_histogram(bins = 30, color = "black") +
+  labs(title = "Distribution of Water Temperature",
+       x = "Water Temperature (°C)", y = "Number of Samples")
+
+wq_temp |> summarize(n = n(), mean = mean(RESULT), median = median(RESULT),
+                     sd = sd(RESULT), min = min(RESULT), max = max(RESULT)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |> kable(caption = "Water temperature (°C)")
+```
+
+### RESULT: dissolved oxygen
+
+```{r do-dist}
+ggplot(wq_do, aes(x = RESULT)) +
+  geom_histogram(bins = 30, color = "black") +
+  labs(title = "Distribution of Dissolved Oxygen",
+       x = "Dissolved Oxygen (mg/L)", y = "Number of Samples")
+
+wq_do |> summarize(n = n(), mean = mean(RESULT), median = median(RESULT),
+                   sd = sd(RESULT), min = min(RESULT), max = max(RESULT)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |> kable(caption = "Dissolved oxygen (mg/L)")
+```
+
+### RESULT: E. coli
+
+```{r ecoli-dist}
+ggplot(ecoli_pos, aes(x = RESULT)) +
+  geom_histogram(bins = 30, color = "black") +
+  scale_x_log10() +
+  labs(title = "Distribution of E. coli (log scale)",
+       x = "E. coli (MPN/100 mL, log scale)", y = "Number of Samples")
+
+wq_ecoli |> summarize(n = n(), mean = mean(RESULT), median = median(RESULT),
+                      sd = sd(RESULT), min = min(RESULT), max = max(RESULT)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |> kable(caption = "E. coli (MPN/100 mL)")
+```
+
+E. coli is strongly right skewed: the mean is far above the median because a few very high counts pull it up. For that reason I use the **median** and a log scale for E. coli throughout.
+
+## Relationships between variables
+
+### 1. Results by site type
+
+```{r by-site-type}
+bind_rows(summ(wq_temp, Parameter = PARAMETER, `Site type` = SITE_TYPE),
+          summ(wq_do,   Parameter = PARAMETER, `Site type` = SITE_TYPE),
+          summ(wq_ecoli, Parameter = PARAMETER, `Site type` = SITE_TYPE)) |>
+  kable(caption = "Summary statistics by parameter and site type")
+
+p_temp_site <- ggplot(wq_temp, aes(x = SITE_TYPE, y = RESULT, fill = SITE_TYPE)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2) +
+  labs(title = "Water Temperature by Site Type", x = "Site Type",
+       y = "Water Temperature (°C)")
+
+p_do_site <- ggplot(wq_do, aes(x = SITE_TYPE, y = RESULT, fill = SITE_TYPE)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2) +
+  labs(title = "Dissolved Oxygen by Site Type", x = "Site Type",
+       y = "Dissolved Oxygen (mg/L)")
+
+p_ecoli_site <- ggplot(ecoli_pos, aes(x = SITE_TYPE, y = RESULT, fill = SITE_TYPE)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2) +
+  scale_y_log10() +
+  labs(title = "E. coli by Site Type (log scale)", x = "Site Type",
+       y = "E. coli (MPN/100 mL, log scale)")
+
+p_temp_site; p_do_site; p_ecoli_site
+```
+
+**Interpretation:** *[After knitting, describe how the median and spread differ across streams, lakes, and springs for each parameter. Check whether springs show the steadiest temperatures, as expected for groundwater-fed sites.]*
+
+### 2. Results by watershed
+
+For each parameter I compare the eight watersheds with the most samples.
+
+```{r by-watershed}
+top8 <- function(data) {
+  data |> count(WATERSHED, sort = TRUE) |> slice_head(n = 8) |> pull(WATERSHED)
+}
+
+ws_box <- function(data, ylab, title, log = FALSE) {
+  d <- data |> filter(WATERSHED %in% top8(data))
+  p <- ggplot(d, aes(x = reorder(WATERSHED, RESULT, median), y = RESULT)) +
+    geom_boxplot(outlier.alpha = 0.2) +
+    coord_flip() +
+    labs(title = title, x = "Watershed", y = ylab)
+  if (log) p <- p + scale_y_log10()
+  p
+}
+
+ws_box(wq_temp, "Water Temperature (°C)", "Water Temperature by Watershed")
+ws_box(wq_do, "Dissolved Oxygen (mg/L)", "Dissolved Oxygen by Watershed")
+ws_box(ecoli_pos, "E. coli (MPN/100 mL, log scale)", "E. coli by Watershed (log scale)", log = TRUE)
+
+# Median results in the top watersheds for each parameter
+bind_rows(
+  wq_temp  |> filter(WATERSHED %in% top8(wq_temp))  |> summ(Parameter = PARAMETER, Watershed = WATERSHED),
+  wq_do    |> filter(WATERSHED %in% top8(wq_do))    |> summ(Parameter = PARAMETER, Watershed = WATERSHED),
+  wq_ecoli |> filter(WATERSHED %in% top8(wq_ecoli)) |> summ(Parameter = PARAMETER, Watershed = WATERSHED)
+) |>
+  select(Parameter, Watershed, n, median, IQR) |>
+  arrange(Parameter, desc(median)) |>
+  kable(caption = "Median and IQR by parameter and watershed (eight most sampled)")
+```
+
+**Interpretation:** *[After knitting, note which watersheds have the highest and lowest medians. Keep in mind that watersheds with few samples, or samples from only some years or site types, may not be directly comparable.]*
+
+### 3. Seasonal pattern (by month)
+
+```{r by-month}
+monthly <- wq_all |>
+  group_by(parameter_label, SITE_TYPE, month_label) |>
+  summarize(n = n(), median = median(RESULT), .groups = "drop")
+
+ggplot(monthly, aes(x = month_label, y = median, color = SITE_TYPE, group = SITE_TYPE)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~parameter_label, scales = "free_y", ncol = 1) +
+  labs(title = "Median Result by Month and Site Type",
+       x = "Month", y = "Median Result (units shown in panel titles)",
+       color = "Site Type")
+
+wq_all |>
+  group_by(Parameter = PARAMETER, Month = month_label) |>
+  summarize(n = n(), median = round(median(RESULT), 2), .groups = "drop") |>
+  pivot_wider(names_from = Month, values_from = median, id_cols = Parameter) |>
+  kable(caption = "Median result by month (all site types)")
+```
+
+**Interpretation:** *[After knitting, describe the seasonal pattern. Water temperature should peak in summer. Dissolved oxygen often moves in the opposite direction because warm water holds less oxygen. Check whether E. coli rises in warm or wet months.]*
+
+### 4. Change over time (by year)
+
+```{r by-year}
+yearly <- wq_all |>
+  filter(year >= 1990) |>
+  group_by(parameter_label, SITE_TYPE, year) |>
+  summarize(n = n(), median = median(RESULT), .groups = "drop") |>
+  filter(n >= 10)          # skip year/site type groups with very few samples
+
+ggplot(yearly, aes(x = year, y = median, color = SITE_TYPE)) +
+  geom_line() +
+  geom_point(size = 1) +
+  facet_wrap(~parameter_label, scales = "free_y", ncol = 1) +
+  labs(title = "Median Result by Year and Site Type, 1990 Onward",
+       subtitle = "Only year and site type groups with at least 10 samples",
+       x = "Year", y = "Median Result (units shown in panel titles)",
+       color = "Site Type")
+
+wq_all |>
+  filter(year >= 1990) |>
+  mutate(Decade = paste0(floor(year / 10) * 10, "s")) |>
+  group_by(Parameter = PARAMETER, Decade) |>
+  summarize(n = n(), median = round(median(RESULT), 2), .groups = "drop") |>
+  kable(caption = "Median result by decade")
+```
+
+**Interpretation:** *[After knitting, describe whether each parameter has risen, fallen, or stayed flat. Because the mix of sites and months changes between years, treat any trend as descriptive rather than causal.]*
+
+### 5. Depth and dissolved oxygen
+
+Where depth was recorded (mostly lakes), I examine how dissolved oxygen and temperature change with depth.
+
+```{r depth-rel}
+depth_data <- wq_all |>
+  filter(!is.na(DEPTH_IN_METERS),
+         PARAMETER %in% c("WATER TEMPERATURE", "DISSOLVED OXYGEN"))
+
+ggplot(depth_data, aes(x = DEPTH_IN_METERS, y = RESULT)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", formula = y ~ s(x), se = FALSE) +
+  facet_wrap(~parameter_label, scales = "free_y") +
+  labs(title = "Water Temperature and Dissolved Oxygen by Sample Depth",
+       x = "Depth (meters)", y = "Result (units shown in panel titles)")
+
+depth_data |>
+  group_by(Parameter = PARAMETER) |>
+  summarize(n = n(),
+            correlation = round(cor(DEPTH_IN_METERS, RESULT, method = "spearman"), 3)) |>
+  kable(caption = "Spearman correlation between depth and result")
+```
+
+**Interpretation:** *[After knitting, describe whether deeper samples tend to be cooler and lower in oxygen. Remember that depth is missing for many samples, so this applies mainly to lakes.]*
+
+# Summary
+
+*[After knitting, write 3 to 5 sentences answering the research question. For each parameter, say how it differs across site types and watersheds and how it changes by month and year. Also restate the key limitation: uneven sampling and missing depth.]*
